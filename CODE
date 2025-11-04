@@ -1,0 +1,567 @@
+import pandas as pd
+import json
+import time
+import os
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import inquirer
+import re
+from apscheduler.schedulers.blocking import BlockingScheduler
+from tabulate import tabulate  # For pretty-printing tables
+
+# -----------------------------------------------------------------
+# --- SECTION 1: CONFIGURATION ---
+# -----------------------------------------------------------------
+SAVE_DIRECTORY = r"F:/imdb_scrap/"
+os.makedirs(SAVE_DIRECTORY, exist_ok=True)
+TOP_250_FILE = os.path.join(SAVE_DIRECTORY, "imdb_top_250_deep.csv")
+GENRES_FILE = os.path.join(SAVE_DIRECTORY, "imdb_top_50_genres.csv")
+
+# -----------------------------------------------------------------
+# --- SECTION 2: SCRAPING FUNCTIONS ---
+# -----------------------------------------------------------------
+
+def scrape_top_250(depth, limit=250):
+    """
+    Scrapes the IMDb Top 250 list using a stable, 2-phase approach.
+    """
+    print(f"\n🎬 Starting IMDb Top 250 Scrape (Depth: {depth})...")
+
+    # --- Driver Setup ---
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--log-level=3")
+    options.add_argument("start-maximized")
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    )
+    
+    driver = webdriver.Chrome(options=options)
+    
+    data = []
+    
+    # --- PHASE 1: Scrape Main List ---
+    try:
+        print("--- Phase 1: Scraping main list (Rank, Title, Year, Rating, Link) ---")
+        driver.get("https://www.imdb.com/chart/top/")
+
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "li.ipc-metadata-list-summary-item"))
+        )
+        
+        movies_list = driver.find_elements(By.CSS_SELECTOR, "li.ipc-metadata-list-summary-item")
+        print(f"✅ Found {len(movies_list)} movies on page. Processing all {len(movies_list)}.")
+
+        for movie in movies_list[:limit]:
+            try:
+                title_element = movie.find_element(By.CSS_SELECTOR, "h3.ipc-title__text")
+                title_text = title_element.text
+                title = title_text.split(". ", 1)[-1]
+                
+                link = movie.find_element(By.TAG_NAME, "a").get_attribute("href")
+
+                # Find year
+                try:
+                    metadata_div = movie.find_element(By.CSS_SELECTOR, 'div[class*="cli-title-metadata"]')
+                    metadata_items = metadata_div.find_elements(By.TAG_NAME, "span")
+                    year = metadata_items[0].text
+                except:
+                    year = "N/A"
+
+                # Find rating
+                try:
+                    rating_element = movie.find_element(By.CSS_SELECTOR, 'span[data-testid="ratingGroup--imdb-rating"]')
+                    # --- FIX: Split text to get only the rating number ---
+                    rating = rating_element.text.split("\n")[0].strip()
+                except:
+                    rating = "N/A"
+
+                movie_data = {
+                    "Rank": title_text.split(".")[0],
+                    "Title": title,
+                    "Year": year,
+                    "Rating": rating,
+                    "Link": link, # Store the link for Phase 2
+                    "Genre": "N/A", # Add placeholders
+                    "Director": "N/A",
+                    "Cast": "N/A"
+                }
+                data.append(movie_data)
+
+            except Exception as e_main:
+                print(f"  ⚠️ Error on main list: {e_main}. Skipping item.")
+                continue
+
+    except Exception as e:
+        print(f"❌ A critical error occurred in Phase 1: {e}")
+        driver.quit()
+        return
+
+    # --- PHASE 2: Deep Scrape (if requested) ---
+    if depth == 'Deep (Title, Year, Rating, Director, and Cast)':
+        print("\n--- Phase 2: Starting Deep Scrape (Genre, Director, Cast) ---")
+        
+        main_tab = driver.current_window_handle
+        
+        for idx, movie_data in enumerate(data, start=1):
+            try:
+                print(f"  > Deep scraping {idx}/{len(data)}: {movie_data['Title']}...")
+                driver.get(movie_data['Link']) # Visit the link in the *same tab*
+
+                WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, 'h1[data-testid="hero__pageTitle"]'))
+                )
+
+                # 1. JSON-LD extraction
+                try:
+                    ld_tags = driver.find_elements(By.CSS_SELECTOR, 'script[type="application/ld+json"]')
+                    for tag in ld_tags:
+                        try:
+                            json_data = json.loads(tag.get_attribute("innerHTML"))
+                            if "genre" in json_data:
+                                genre = (
+                                    ", ".join(json_data["genre"])
+                                    if isinstance(json_data["genre"], list)
+                                    else json_data["genre"]
+                                )
+                                movie_data['Genre'] = genre
+                            if "actor" in json_data:
+                                cast = ", ".join([a["name"] for a in json_data["actor"][:3] if "name" in a])
+                                movie_data['Cast'] = cast
+                        except Exception:
+                            continue
+                except Exception:
+                    pass 
+
+                # 2. Fallback for Director
+                try:
+                    credits = driver.find_elements(By.CSS_SELECTOR, 'li[data-testid="title-pc-principal-credit"]')
+                    for credit in credits:
+                        try:
+                            label = credit.find_element(By.CSS_SELECTOR, "span.ipc-metadata-list-item__label").text.strip().lower()
+                            if "director" in label:
+                                names = [a.text for a in credit.find_elements(By.CSS_SELECTOR, "a") if a.text.strip()]
+                                if names:
+                                    movie_data['Director'] = ", ".join(names)
+                                    break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+                
+                print(f"  ✅ Success: ({movie_data['Year']}) | Director: {movie_data['Director']}")
+
+            except Exception as e_deep:
+                print(f"    > Failed to deep scrape {movie_data['Title']}: {e_deep}")
+    
+    # --- Cleanup and Save ---
+    driver.quit()
+    
+    if data:
+        print("\n📊 Compiling data into DataFrame...")
+        
+        # Clean up the 'Link' column before saving
+        df = pd.DataFrame(data)
+        del df['Link'] # We don't need the link in the final CSV
+        
+        df.to_csv(TOP_250_FILE, index=False, encoding='utf-8')
+        print(f"\n✅ Scrape complete! Saved successfully to: {TOP_250_FILE}")
+    else:
+        print("\n❌ No data was scraped. Output file not created.")
+
+# --- UPDATED FUNCTION: IMDb Genre Scraper (2025 layout fixed) ---
+def scrape_top_50_by_genre(genre_list):
+    """
+    Scrapes the top 50 movies for given genres using IMDb's 2025 layout.
+    """
+    print(f"\nStarting Top 50 by Genre scrape from IMDb...")
+    all_genres_data = []
+
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless")
+    options.add_argument("--log-level=3")
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+    for genre_name in genre_list:
+        print(f"--- Scraping {genre_name} ---")
+        genre_slug = genre_name.lower().strip()
+        url = f"https://www.imdb.com/search/title/?genres={genre_slug}&count=50"
+
+        driver = webdriver.Chrome(options=options)
+        try:
+            driver.get(url)
+            print("  > Page loaded. Waiting for movie list...")
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "li.ipc-metadata-list-summary-item"))
+            )
+            movie_containers = driver.find_elements(By.CSS_SELECTOR, "li.ipc-metadata-list-summary-item")
+            # Filter out potential empty ad containers
+            movie_containers = [m for m in movie_containers if m.text.strip() != ""]
+            print(f"  > Found {len(movie_containers)} items.")
+
+            count = 0
+            for movie in movie_containers[:50]:
+                try:
+                    title_element = movie.find_element(By.CSS_SELECTOR, 'h3.ipc-title__text')
+                    title_text = title_element.text
+                    title = title_text.split(". ", 1)[1] if ". " in title_text else title_text
+
+                    # Find year
+                    try:
+                        # Find the div that has "cli-title-metadata" *in* its class name
+                        metadata_div = movie.find_element(By.CSS_SELECTOR, 'div[class*="cli-title-metadata"]')
+                        # Find all span tags inside it
+                        metadata_items = metadata_div.find_elements(By.TAG_NAME, "span")
+                        year = metadata_items[0].text # Get the first span (Year)
+                    except:
+                        year = "N/A"
+
+                    # Find rating
+                    try:
+                        rating_element = movie.find_element(By.CSS_SELECTOR, 'span[data-testid="ratingGroup--imdb-rating"]')
+                        # --- FIX: Split text to get only the rating number ---
+                        rating = rating_element.text.split("\n")[0].strip()
+                    except:
+                        rating = "N/A"
+
+                    print(f"    - {title} ({year}) - Rating: {rating}")
+
+                    all_genres_data.append({
+                        "Genre": genre_name,
+                        "Title": title,
+                        "Year": year,
+                        "Rating": rating
+                    })
+                    count += 1
+                except:
+                    continue # Skip this item (likely an ad)
+
+            print(f"Successfully found and printed {count} movies for {genre_name}.")
+
+        except Exception as e:
+            print(f"Error scraping {genre_name}: {e}")
+        finally:
+            driver.quit()
+            time.sleep(1)
+
+    if all_genres_data:
+        base_filename = "imdb_top_50_genres.csv"
+        full_path = os.path.join(SAVE_DIRECTORY, base_filename)
+        os.makedirs(SAVE_DIRECTORY, exist_ok=True)
+        df = pd.DataFrame(all_genres_data)
+        df.to_csv(full_path, index=False)
+        print(f"\n✅ Successfully saved all data to '{full_path}'")
+    else:
+        print("\n❌ No genre data was extracted.")
+
+
+# -----------------------------------------------------------------
+# --- SECTION 3: SCHEDULER & NEW FEATURES ---
+# -----------------------------------------------------------------
+
+def run_all_scrapes():
+    """Helper function to run all scrapers for the scheduler."""
+    print("\n--- [AUTO-UPDATE] Running 24-hour update... ---")
+    
+    # 1. Run the Top 250 Deep Scrape
+    scrape_top_250(depth='Deep (Title, Year, Rating, Director, and Cast)')
+    
+    # 2. Run the Genre Scrape with a default list
+    default_genres = ['Action', 'Drama', 'Sci-Fi', 'Comedy']
+    scrape_top_50_by_genre(default_genres)
+    
+    print("\n--- [AUTO-UPDATE] All tasks finished. Waiting for next 24-hour cycle. ---")
+
+
+def start_scheduler():
+    """Initializes and starts the 24-hour auto-update scheduler."""
+    scheduler = BlockingScheduler()
+    
+    # Add the job to run every 24 hours (86400 seconds)
+    scheduler.add_job(run_all_scrapes, 'interval', seconds=86400)
+    
+    print("="*50)
+    print("✅ SCHEDULER STARTED")
+    print("The script will now run all scrapers once every 24 hours.")
+    print("Press Ctrl+C to stop the scheduler.")
+    print("="*50)
+    
+    try:
+        scheduler.start()
+    except (KeyboardInterrupt, SystemExit):
+        print("\nScheduler stopped by user.")
+
+# --- NEW FEATURE 4 ---
+def get_recommendations():
+    """Recommends movies based on Director or Genre from saved CSV."""
+    print("\n--- 🎬 Movie Recommender ---")
+    
+    # 1. Load the deep scrape data
+    try:
+        df = pd.read_csv(TOP_250_FILE)
+    except FileNotFoundError:
+        print(f"Error: Could not find '{TOP_250_FILE}'.")
+        print("Please run the 'Top 250' deep scrape (Option 1) first.")
+        return
+    except pd.errors.EmptyDataError:
+        print(f"Error: The file '{TOP_250_FILE}' is empty.")
+        print("Please run the 'Top 250' deep scrape (Option 1) first.")
+        return
+    except Exception as e:
+        print(f"An unexpected error occurred loading the file: {e}")
+        return
+
+    # 2. Get user input
+    answers = inquirer.prompt([
+        inquirer.Text('movie', message="Enter a movie title you like (from the Top 250)")
+    ])
+    if not answers or not answers['movie']:
+        print("Cancelled.")
+        return
+
+    title_query = answers['movie'].strip()
+
+    # 3. Find the movie (case-insensitive)
+    try:
+        movie_row = df[df['Title'].str.contains(title_query, case=False, na=False)].iloc[0]
+    except IndexError:
+        print(f"Sorry, couldn't find a movie matching '{title_query}' in your list.")
+        return
+
+    print(f"\nFound: {movie_row['Title']} ({movie_row['Year']})")
+
+    # 4. Get its Director and Genres
+    director = movie_row['Director']
+    try:
+        genres = set([g.strip() for g in movie_row['Genre'].split(',')])
+    except:
+        genres = set()
+
+    # 5. Find recommendations
+    # Find by director
+    if pd.notna(director) and director != "N/A":
+        director_recs = df[
+            (df['Director'] == director) & 
+            (df['Title'] != movie_row['Title']) # Exclude the movie itself
+        ]
+    else:
+        director_recs = pd.DataFrame()
+
+    # Find by genre
+    if genres:
+        # We need to find rows that share at least one genre
+        def shares_genre(row_genres):
+            try:
+                current_genres = set([g.strip() for g in row_genres.split(',')])
+                return not genres.isdisjoint(current_genres) # Returns True if they share at least one
+            except:
+                return False
+                
+        genre_mask = df['Genre'].apply(shares_genre)
+        genre_recs = df[genre_mask & (df['Title'] != movie_row['Title'])]
+    else:
+        genre_recs = pd.DataFrame()
+
+    # 6. Display results
+    if not director_recs.empty:
+        print("\n--- 🎬 Because you like the director ---")
+        # --- TABULAR FORMAT ---
+        print(tabulate(director_recs[['Rank', 'Title', 'Year', 'Rating']], headers='keys', tablefmt='psql', showindex=False))
+
+    if not genre_recs.empty:
+        print("\n--- 🎭 Because you like similar genres (Top 10) ---")
+        # --- TABULAR FORMAT (FIXED: Removed 'Genre' to prevent wrapping) ---
+        print(tabulate(genre_recs[['Rank', 'Title', 'Year', 'Rating']].head(10), headers='keys', tablefmt='psql', showindex=False))
+            
+    if director_recs.empty and genre_recs.empty:
+        print("Couldn't find any other movies with the same director or genre in the list.")
+
+# --- NEW FEATURE 5 ---
+def show_terminal_summary():
+    """
+    NEW: Prints a simple dashboard-like summary to the terminal.
+    """
+    print("\n--- 📊 Terminal Summary ---")
+    
+    # 1. Load Top 250 Data
+    try:
+        df_top250 = pd.read_csv(TOP_250_FILE)
+    except Exception as e:
+        print(f"\nCould not load Top 250 data: {e}")
+        df_top250 = None
+
+    # 2. Load Genre Data
+    try:
+        df_genres = pd.read_csv(GENRES_FILE)
+    except Exception as e:
+        print(f"\nCould not load Genre data: {e}")
+        df_genres = None
+
+    if df_top250 is None and df_genres is None:
+        print("No data found. Please run a scraper first.")
+        return
+
+    # 3. Print Top 250 Summary
+    if df_top250 is not None:
+        print("\n--- Top 250 Summary ---")
+        print(f"Total Movies: {len(df_top250)}")
+        
+        # --- FIX: Convert to numeric BEFORE calculating mean ---
+        df_top250['Rating'] = pd.to_numeric(df_top250['Rating'], errors='coerce')
+        print(f"Average Rating: {df_top250['Rating'].mean():.2f}")
+        
+        print("\nTop 5 Rated Movies in your list:")
+        # --- FIX: Select only the columns for a narrow table ---
+        cols_to_show = ['Rank', 'Title', 'Year', 'Rating']
+        df_display = df_top250[cols_to_show].head(5)
+        print(tabulate(df_display, headers='keys', tablefmt='psql', showindex=False))
+
+
+    # 4. Print Genre Summary
+    if df_genres is not None:
+        print("\n\n--- Genre Scrape Summary ---")
+        print(f"Total Movies Scraped: {len(df_genres)}")
+        print("\nGenres you scraped:")
+        print(df_genres['Genre'].value_counts().to_string())
+        
+        print("\nTop 5 from your Genre list:")
+        # --- FIX: Select only the columns for a narrow table ---
+        cols_to_show_genres = ['Genre', 'Title', 'Year', 'Rating']
+        df_genres_display = df_genres[cols_to_show_genres].head(5)
+        print(tabulate(df_genres_display, headers='keys', tablefmt='psql', showindex=False))
+
+
+def show_dashboard_instructions():
+    """Prints instructions on how to run the Streamlit dashboard."""
+    print("\n--- 📊 Live Web Dashboard Instructions ---")
+    print("This feature opens a visual dashboard in your WEB BROWSER.")
+    print("\n1. Open a **NEW** terminal or command prompt (keep this one running).")
+    print(f"2. Navigate to your project folder: cd {SAVE_DIRECTORY}")
+    print("3. Run the following command:")
+    print("\n    streamlit run dashboard.py\n")
+    print("This will open the dashboard in your web browser.")
+
+# -----------------------------------------------------------------
+# --- SECTION 4: INTERACTIVE MENU FUNCTIONS ---
+# -----------------------------------------------------------------
+
+def get_scraping_depth():
+    depth_questions = [
+        inquirer.List(
+            'depth',
+            message="Select scraping depth (Deep is much slower)",
+            choices=[
+                'Fast (Title, Year, Rating)',
+                'Deep (Title, Year, Rating, Director, and Cast)'
+            ]
+        )
+    ]
+    answers = inquirer.prompt(depth_questions)
+    return answers['depth'] if answers else None
+
+
+def run_genre_scraper():
+    genre_question = [
+        inquirer.Text(
+            'genres',
+            message="Enter genres (e.g., Action, Drama, Sci-Fi)"
+        )
+    ]
+    answers = inquirer.prompt(genre_question)
+
+    if not answers:
+        print("Cancelled. Returning to menu.")
+        return
+
+    genres_list = [genre.strip() for genre in answers['genres'].split(',')]
+    if genres_list and genres_list[0] != '':
+        scrape_top_50_by_genre(genres_list)
+    else:
+        print("No genres entered. Returning to menu.")
+
+
+def list_saved_files():
+    print(f"\n--- Files in {SAVE_DIRECTORY} ---")
+    if not os.path.isdir(SAVE_DIRECTORY):
+        print(f"Error: Save directory not found at '{SAVE_DIRECTORY}'")
+        return
+    try:
+        all_files = os.listdir(SAVE_DIRECTORY)
+        csv_files = [f for f in all_files if f.endswith('.csv')]
+        if not csv_files:
+            print("No .csv files in the directory.")
+        else:
+            print(f"Found {len(csv_files)} CSV file(s):")
+            for f in csv_files:
+                print(f"  > {f}")
+    except Exception as e:
+        print(f"An error occurred while reading the directory: {e}")
+
+
+def main_menu():
+    while True:
+        questions = [
+            inquirer.List(
+                'choice',
+                message="Welcome to the IMDb Scraper! What would you like to do?",
+                choices=[
+                    '1. Scrape IMDb Top 250 Movies',
+                    '2. Scrape Top 50 by Genre (from IMDb)',
+                    '3. List Saved CSV Files',
+                    '4. Get Movie Recommendations',
+                    '5. Show Terminal Summary', # <-- YOUR NEW FEATURE
+                    '6. View Live Web Dashboard', # <-- Renamed
+                    '7. Run Automatically (Update every 24h)', 
+                    '8. Exit' # <-- Renamed
+                ]
+            )
+        ]
+
+        answers = inquirer.prompt(questions)
+        if not answers:
+            print("\nGoodbye!")
+            break
+
+        choice = answers.get('choice')
+
+        if choice.startswith('1.'):
+            depth = get_scraping_depth()
+            if depth:
+                scrape_top_250(depth='Deep (Title, Year, Rating, Director, and Cast)' if 'Deep' in depth else 'Fast (Title, Year, Rating)')
+        elif choice.startswith('2.'):
+            run_genre_scraper()
+        elif choice.startswith('3.'):
+            list_saved_files()
+        elif choice.startswith('4.'):
+            get_recommendations()
+        elif choice.startswith('5.'):
+            show_terminal_summary() # <-- YOUR NEW FEATURE
+        elif choice.startswith('6.'):
+            show_dashboard_instructions()
+        elif choice.startswith('7.'):
+            run_all_scrapes() # Run it once *now*
+            start_scheduler() # Then start the 24h timer
+            break 
+        elif choice.startswith('8.'):
+            print("Goodbye!")
+            break
+
+        print("\n" + "=" * 30)
+        print("Returning to main menu...")
+        print("=" * 30)
+        time.sleep(2)
+
+
+# -----------------------------------------------------------------
+# --- SECTION 5: RUN THE APPLICATION ---
+# -----------------------------------------------------------------
+
+if __name__ == "__main__":
+    try:
+        main_menu()
+    except KeyboardInterrupt:
+        print("\nApplication closed by user. Goodbye!")
